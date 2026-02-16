@@ -1,0 +1,10 @@
+Product,Channel,State,Demand_Units
+Product A,Amazon,CA,5000
+Product A,Walmart,TX,3000
+Product A,Target,IL,2500
+Product A,Amazon,NY,4000
+Product B,Amazon,CA,3500
+Product B,Walmart,TX,2000
+Product B,Target,IL,1500
+Product C,Amazon,FL,2800
+Product C,Walmart,GA,2200
