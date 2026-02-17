@@ -8,6 +8,7 @@ from geopy.distance import geodesic
 from geopy.geocoders import Nominatim
 import json
 from io import BytesIO
+import time
 
 # Page configuration
 st.set_page_config(
@@ -164,10 +165,13 @@ if 'customer_selected_warehouses' not in st.session_state:
     st.session_state.customer_selected_warehouses = st.session_state.warehouses['Name'].tolist()
 
 
+@st.cache_data
 def geocode_address(address):
     """Convert address to coordinates (中文: 将地址转换为坐标)"""
+    # Respect Nominatim usage policy (max 1 request/sec) to avoid 429 errors
+    time.sleep(1.1)
     try:
-        geolocator = Nominatim(user_agent="warehouse_optimizer")
+        geolocator = Nominatim(user_agent="smart_warehouse_optimizer_app_v2_cloud")
         location = geolocator.geocode(address)
         if location:
             return location.latitude, location.longitude

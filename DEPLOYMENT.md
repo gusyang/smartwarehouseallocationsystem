@@ -77,6 +77,18 @@ streamlit run app_v2.py
 - 对于个人和小团队完全够用
 - Perfect for individuals and small teams
 
+### 🔄 如何更新代码 | How to Update Code
+
+修改代码后，只需推送到 GitHub，Streamlit Cloud 会自动重新部署：
+
+After modifying code, just push to GitHub and Streamlit Cloud will automatically redeploy:
+
+```bash
+git add .
+git commit -m "Update app features"
+git push
+```
+
 ---
 
 ## 3️⃣ Heroku 部署 | Heroku Deployment
@@ -557,3 +569,24 @@ lsof -ti:8501 | xargs kill -9
 ---
 
 **祝部署顺利! | Happy Deploying! 🚀**
+
+---
+
+## 8️⃣ CI/CD 自动化 (GitHub Actions) | CI/CD Automation
+
+虽然 Streamlit Cloud 会自动检测 GitHub 代码变更并部署，但建议配置 GitHub Actions 进行自动化测试（CI），确保代码质量。
+
+While Streamlit Cloud automatically detects changes and deploys, it is recommended to set up GitHub Actions for Continuous Integration (CI) to ensure code quality.
+
+**工作流文件 | Workflow File**: `.github/workflows/streamlit_ci.yml`
+
+**功能 | Features**:
+- ✅ **自动触发**: 每次 Push 或 Pull Request 到 main 分支时运行
+- ✅ **环境检查**: 自动安装 Python 3.10 和依赖
+- ✅ **语法检查**: 使用 Flake8 检查 Python 语法错误
+- ✅ **冒烟测试**: 验证 `app_v2.py` 是否能成功编译
+
+**如何启用 | How to Enable**:
+1. 将 `.github/workflows/streamlit_ci.yml` 文件推送到仓库
+2. 在 GitHub 仓库的 "Actions" 标签页中即可查看运行状态
+3. 如果测试失败，Streamlit Cloud 仍会尝试部署（除非在 Streamlit 后台配置了保护），但你会收到邮件通知。
