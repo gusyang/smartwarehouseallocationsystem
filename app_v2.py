@@ -286,6 +286,108 @@ def calculate_available_inventory(week):
     return inventory
 
 
+def solve_lp_with_inventory(allocation_df, inventory_df, warehouses_df, ignore_capacity=False):
+    """
+    Solve LP with split variables to account for inventory deduction.
+    Variables: [x_inv_1...n, x_ship_1...n]
+    x_inv: Units from inventory (Cost = 0)
+    x_ship: Units shipped (Cost = Rate)
+    """
+    n_routes = len(allocation_df)
+    n_vars = 2 * n_routes  # Split variables
+    
+    # Costs: 0 for inventory, Rate for shipping
+    c_inv = np.zeros(n_routes)
+    c_ship = allocation_df['Cost_Per_Unit'].values
+    c = np.concatenate([c_inv, c_ship])
+    
+    # Constraints lists
+    A_eq = []
+    b_eq = []
+    A_ub = []
+    b_ub = []
+    
+    # 1. Demand Constraints: x_inv + x_ship = Demand
+    # Group by unique demand (Product, Channel, State)
+    unique_demands = allocation_df.groupby(['Product', 'Channel', 'State'])['Demand'].first()
+    
+    for (product, channel, state), demand_val in unique_demands.items():
+        constraint = np.zeros(n_vars)
+        mask = (
+            (allocation_df['Product'] == product) & 
+            (allocation_df['Channel'] == channel) & 
+            (allocation_df['State'] == state)
+        )
+        # Set 1 for both inv and ship variables corresponding to this route
+        constraint[:n_routes][mask] = 1
+        constraint[n_routes:][mask] = 1
+        
+        A_eq.append(constraint)
+        b_eq.append(demand_val)
+        
+    # 2. Inventory Constraints: Sum(x_inv) <= Available
+    # For each warehouse
+    unique_warehouses = allocation_df['Warehouse'].unique()
+    
+    for wh_name in unique_warehouses:
+        # Inventory constraint
+        constraint_inv = np.zeros(n_vars)
+        mask = allocation_df['Warehouse'] == wh_name
+        constraint_inv[:n_routes][mask] = 1
+        
+        # Get available inventory
+        avail = inventory_df[inventory_df['Name'] == wh_name]['Available'].values
+        avail_val = avail[0] if len(avail) > 0 else 0
+        
+        A_ub.append(constraint_inv)
+        b_ub.append(max(0, avail_val))
+        
+        # 3. Capacity Constraints: Sum(x_inv + x_ship) <= Capacity
+        if not ignore_capacity:
+            constraint_cap = np.zeros(n_vars)
+            constraint_cap[:n_routes][mask] = 1
+            constraint_cap[n_routes:][mask] = 1
+            
+            cap = warehouses_df[warehouses_df['Name'] == wh_name]['Capacity'].values
+            cap_val = cap[0] if len(cap) > 0 else 100000
+            
+            A_ub.append(constraint_cap)
+            b_ub.append(cap_val)
+            
+    # Convert to numpy arrays
+    A_eq = np.array(A_eq) if A_eq else None
+    b_eq = np.array(b_eq) if b_eq else None
+    A_ub = np.array(A_ub) if A_ub else None
+    b_ub = np.array(b_ub) if b_ub else None
+    
+    bounds = [(0, None) for _ in range(n_vars)]
+    
+    # Solve
+    try:
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+        
+        if res.success:
+            # Extract results
+            x_inv = res.x[:n_routes]
+            x_ship = res.x[n_routes:]
+            
+            result_df = allocation_df.copy()
+            result_df['Allocated_From_Inv'] = x_inv
+            result_df['Allocated_Shipped'] = x_ship
+            result_df['Allocated_Units'] = x_inv + x_ship
+            
+            # Total cost is only based on shipped units
+            result_df['Total_Cost'] = result_df['Allocated_Shipped'] * result_df['Cost_Per_Unit']
+            
+            # Filter small values
+            result_df = result_df[result_df['Allocated_Units'] > 0.01].copy()
+            
+            return result_df, res.fun
+    except Exception as e:
+        st.error(f"Optimization failed: {e}")
+        return None, 0
+    return None, 0
+
 def optimize_allocation_multi_week():
     """
     Optimize allocation for both Week 3 and Week 4
@@ -348,83 +450,14 @@ def optimize_allocation_multi_week():
             results[week] = (None, None)
             continue
         
-        n_vars = len(allocation_df)
-        c = allocation_df['Cost_Per_Unit'].values
+        # Use new solver with inventory logic
+        result_df, total_cost = solve_lp_with_inventory(allocation_df, inventory, warehouses)
         
-        # Demand constraints - MUST meet all demand
-        demand_constraints = []
-        demand_bounds = []
-        
-        unique_demands = allocation_df.groupby(['Product', 'Channel', 'State'])['Demand'].first()
-        
-        for (product, channel, state), demand_val in unique_demands.items():
-            constraint = np.zeros(n_vars)
-            mask = (
-                (allocation_df['Product'] == product) & 
-                (allocation_df['Channel'] == channel) & 
-                (allocation_df['State'] == state)
-            )
-            constraint[mask] = 1
-            demand_constraints.append(constraint)
-            demand_bounds.append(demand_val)
-        
-        # Warehouse capacity constraints - can ship UP TO capacity
-        # (but we want to minimize shipping, so optimizer will choose minimum needed)
-        capacity_constraints = []
-        capacity_bounds = []
-        
-        for wh_name in warehouses['Name']:
-            constraint = np.zeros(n_vars)
-            mask = allocation_df['Warehouse'] == wh_name
-            constraint[mask] = 1
-            capacity_constraints.append(constraint)
-            
-            # Max capacity for shipping TO this warehouse
-            wh_capacity = warehouses[warehouses['Name'] == wh_name]['Capacity'].values
-            if len(wh_capacity) > 0:
-                capacity_bounds.append(wh_capacity[0])
-            else:
-                capacity_bounds.append(100000)  # Large number if not found
-        
-        A_eq = np.array(demand_constraints) if demand_constraints else None
-        b_eq = np.array(demand_bounds) if demand_bounds else None
-        
-        A_ub = np.array(capacity_constraints) if capacity_constraints else None
-        b_ub = np.array(capacity_bounds) if capacity_bounds else None
-        
-        bounds = [(0, None) for _ in range(n_vars)]
-        
-        # Solve the optimization
-        try:
-            if A_eq is not None and A_ub is not None:
-                result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, 
-                                bounds=bounds, method='highs')
-            elif A_eq is not None:
-                result = linprog(c, A_eq=A_eq, b_eq=b_eq, 
-                                bounds=bounds, method='highs')
-            else:
-                result = None
-            
-            if result and result.success:
-                allocation_df['Allocated_Units'] = result.x
-                allocation_df['Total_Cost'] = allocation_df['Allocated_Units'] * allocation_df['Cost_Per_Unit']
-                
-                # Filter out very small allocations
-                allocation_df = allocation_df[allocation_df['Allocated_Units'] > 0.01].copy()
-                
-                # Add "Ship Required" column - how much needs to be shipped TO warehouse
-                allocation_df['Ship_Required'] = allocation_df.apply(
-                    lambda row: max(0, row['Allocated_Units'] - row['Current_Available']), 
-                    axis=1
-                )
-                
-                total_cost = result.fun
-                results[week] = (allocation_df, total_cost)
-            else:
-                results[week] = (None, None)
-        except Exception as e:
-            st.error(f"Optimization error for Week {week}: {str(e)}")
-            results[week] = (None, None)
+        if result_df is not None:
+            results[week] = (result_df, total_cost)
+        else:
+            st.error(f"Optimization failed for Week {week}")
+            results[week] = (None, 0)
     
     return results
 
@@ -450,6 +483,7 @@ def calculate_customer_cost_manual():
     
     # Get customer default warehouses for validation
     customer_default_warehouses = st.session_state.get('customer_selected_warehouses', [])
+    warehouses_df = st.session_state.warehouses
     
     results = {}
     
@@ -457,6 +491,7 @@ def calculate_customer_cost_manual():
         alloc_col = f'Allocated_Units_Week{week}'
         
         customer_allocation = []
+        inventory = calculate_available_inventory(week)
         
         for _, plan in customer_plan.iterrows():
             product = plan['Product']
@@ -487,11 +522,43 @@ def calculate_customer_cost_manual():
                     'Allocated_Units': allocated_units,
                     'Cost_Per_Unit': cost_per_unit,
                     'Distance_Miles': distance,
-                    'Total_Cost': allocated_units * cost_per_unit
+                    # Initial total cost, will be adjusted below
+                    'Total_Cost_Raw': allocated_units * cost_per_unit
                 })
         
         customer_df = pd.DataFrame(customer_allocation)
-        total_cost = customer_df['Total_Cost'].sum() if not customer_df.empty else 0
+        
+        if not customer_df.empty:
+            # Apply inventory deduction logic manually
+            # For each warehouse, deduct available inventory from allocations (prioritizing expensive routes)
+            customer_df['Allocated_Shipped'] = customer_df['Allocated_Units'] # Default all shipped
+            customer_df['Allocated_From_Inv'] = 0.0
+            
+            for wh in customer_df['Warehouse'].unique():
+                # Get available inventory
+                avail = inventory[inventory['Name'] == wh]['Available'].values
+                avail_val = avail[0] if len(avail) > 0 else 0
+                
+                if avail_val > 0:
+                    # Get allocations for this warehouse, sorted by cost desc
+                    wh_mask = customer_df['Warehouse'] == wh
+                    wh_allocs = customer_df[wh_mask].sort_values('Cost_Per_Unit', ascending=False)
+                    
+                    for idx, row in wh_allocs.iterrows():
+                        needed = row['Allocated_Units']
+                        can_cover = min(needed, avail_val)
+                        
+                        customer_df.at[idx, 'Allocated_From_Inv'] = can_cover
+                        customer_df.at[idx, 'Allocated_Shipped'] = needed - can_cover
+                        
+                        avail_val -= can_cover
+                        if avail_val <= 0:
+                            break
+            
+            customer_df['Total_Cost'] = customer_df['Allocated_Shipped'] * customer_df['Cost_Per_Unit']
+            total_cost = customer_df['Total_Cost'].sum()
+        else:
+            total_cost = 0
         
         results[week] = (customer_df, total_cost)
     
@@ -575,53 +642,13 @@ def calculate_customer_cost_auto(selected_warehouses=None):
             results[week] = (None, 0)
             continue
         
-        n_vars = len(allocation_df)
-        c = allocation_df['Cost_Per_Unit'].values
+        # Use new solver with inventory logic (ignore capacity for customer plan)
+        result_df, total_cost = solve_lp_with_inventory(allocation_df, inventory, warehouses, ignore_capacity=True)
         
-        # Demand constraints - MUST meet all demand
-        demand_constraints = []
-        demand_bounds = []
-        
-        unique_demands = allocation_df.groupby(['Product', 'Channel', 'State'])['Demand'].first()
-        
-        for (product, channel, state), demand_val in unique_demands.items():
-            constraint = np.zeros(n_vars)
-            mask = (
-                (allocation_df['Product'] == product) & 
-                (allocation_df['Channel'] == channel) & 
-                (allocation_df['State'] == state)
-            )
-            constraint[mask] = 1
-            demand_constraints.append(constraint)
-            demand_bounds.append(demand_val)
-        
-        # NO CAPACITY CONSTRAINTS for Customer Plan
-        # We assume customer forces shipment regardless of inventory
-        
-        A_eq = np.array(demand_constraints) if demand_constraints else None
-        b_eq = np.array(demand_bounds) if demand_bounds else None
-        
-        bounds = [(0, None) for _ in range(n_vars)]
-        
-        # Solve optimization for customer's warehouses
-        try:
-            # Use highs method
-            result = linprog(c, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
-            
-            if result and result.success:
-                allocation_df['Allocated_Units'] = result.x
-                allocation_df['Total_Cost'] = allocation_df['Allocated_Units'] * allocation_df['Cost_Per_Unit']
-                
-                # Filter out very small allocations
-                allocation_df = allocation_df[allocation_df['Allocated_Units'] > 0.01].copy()
-                
-                total_cost = result.fun
-                results[week] = (allocation_df, total_cost)
-            else:
-                st.error(f"Failed to optimize customer allocation for Week {week}. Check if selected warehouses can reach all DCs.")
-                results[week] = (None, 0)
-        except Exception as e:
-            st.error(f"Customer allocation error for Week {week}: {str(e)}")
+        if result_df is not None:
+            results[week] = (result_df, total_cost)
+        else:
+            st.error(f"Optimization failed for Week {week}")
             results[week] = (None, 0)
     
     return results
@@ -1228,13 +1255,15 @@ elif page == "🤖 Run Scenarios":
                     
                     col1, col2 = st.columns([2, 1])
                     with col1:
-                        st.metric("Total Cost (总成本)", f"${total_cost:,.2f}", help="Using Market rates (使用市场费率)")
+                        st.metric("Total Cost (总成本)", f"${total_cost:,.2f}", 
+                                 help="Using Market rates. Cost reduced by available inventory. (使用市场费率，已扣除可用库存)")
                     with col2:
                         st.metric("Total Units (总数量)", f"{allocation_df['Allocated_Units'].sum():,.0f}")
                     
                     st.markdown("**Allocation Details (分配详情)**")
-                    display_alloc = allocation_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Cost_Per_Unit', 'Total_Cost']].copy()
+                    display_alloc = allocation_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Allocated_Shipped', 'Cost_Per_Unit', 'Total_Cost']].copy()
                     display_alloc['Allocated_Units'] = display_alloc['Allocated_Units'].round(0)
+                    display_alloc['Allocated_Shipped'] = display_alloc['Allocated_Shipped'].round(0)
                     display_alloc['Cost_Per_Unit'] = display_alloc['Cost_Per_Unit'].round(3)
                     display_alloc['Total_Cost'] = display_alloc['Total_Cost'].round(2)
                     st.dataframe(display_alloc, use_container_width=True, hide_index=True)
@@ -1274,13 +1303,15 @@ elif page == "🤖 Run Scenarios":
                     
                     col1, col2 = st.columns([2, 1])
                     with col1:
-                        st.metric("Total Cost (总成本)", f"${total_cost:,.2f}", help="Using TMS rates (使用TMS费率)")
+                        st.metric("Total Cost (总成本)", f"${total_cost:,.2f}", 
+                                 help="Using TMS rates. Cost reduced by available inventory. (使用TMS费率，已扣除可用库存)")
                     with col2:
                         st.metric("Total Units (总数量)", f"{allocation_df['Allocated_Units'].sum():,.0f}")
                     
                     st.markdown("**Allocation Details (分配详情)**")
-                    display_alloc = allocation_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Cost_Per_Unit', 'Total_Cost']].copy()
+                    display_alloc = allocation_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Allocated_Shipped', 'Cost_Per_Unit', 'Total_Cost']].copy()
                     display_alloc['Allocated_Units'] = display_alloc['Allocated_Units'].round(0)
+                    display_alloc['Allocated_Shipped'] = display_alloc['Allocated_Shipped'].round(0)
                     display_alloc['Cost_Per_Unit'] = display_alloc['Cost_Per_Unit'].round(3)
                     display_alloc['Total_Cost'] = display_alloc['Total_Cost'].round(2)
                     st.dataframe(display_alloc, use_container_width=True, hide_index=True)
@@ -1411,13 +1442,14 @@ elif page == "📈 Cost Comparison":
                         st.info(f"Total Cost: ${cust_cost:,.2f} | Market Rate: ${st.session_state.market_shipping_rate:.3f}/unit/100mi")
                         
                         # Prepare customer data for display
-                        cust_display = customer_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
+                        cust_display = customer_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Allocated_Shipped', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
                         cust_display['Allocated_Units'] = cust_display['Allocated_Units'].round(0).astype(int)
+                        cust_display['Allocated_Shipped'] = cust_display['Allocated_Shipped'].round(0).astype(int)
                         cust_display['Cost_Per_Unit'] = cust_display['Cost_Per_Unit'].apply(lambda x: f"${x:.4f}")
                         cust_display['Distance_Miles'] = cust_display['Distance_Miles'].round(1)
                         cust_display['Total_Cost'] = cust_display['Total_Cost'].apply(lambda x: f"${x:,.2f}")
                         
-                        cust_display.columns = ['Product', 'Warehouse', 'Channel', 'State', 'Units', 'Rate ($/unit)', 'Distance (mi)', 'Cost']
+                        cust_display.columns = ['Product', 'Warehouse', 'Channel', 'State', 'Units', 'Shipped', 'Rate ($/unit)', 'Distance (mi)', 'Cost']
                         
                         st.dataframe(cust_display, use_container_width=True, hide_index=True)
                         
@@ -1438,13 +1470,179 @@ elif page == "📈 Cost Comparison":
                         st.info(f"Total Cost: ${smart_cost:,.2f} | TMS Rate: ${st.session_state.tms_shipping_rate:.3f}/unit/100mi")
                         
                         # Prepare smart data for display
-                        smart_display = smart_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
+                        smart_display = smart_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Allocated_Shipped', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
                         smart_display['Allocated_Units'] = smart_display['Allocated_Units'].round(0).astype(int)
+                        smart_display['Allocated_Shipped'] = smart_display['Allocated_Shipped'].round(0).astype(int)
+                        smart_display['Cost_Per_Unit'] = smart_display['Cost_Per_Unit'].apply(lambda x: f"${x:.4f}")
+                        smart_display['Distance_Miles'] = smart_display['Distance_Miles'].round(1)
+                        smart_display['Total_Cost'] = smart_display['Total_Cost'].apply(lambda x: f"${x:,.2f}")
+                        
+                        smart_display.columns = ['Product', 'Warehouse', 'Channel', 'State', 'Units', 'Shipped', 'Rate ($/unit)', 'Distance (mi)', 'Cost']
+                        
+                        st.dataframe(smart_display, use_container_width=True, hide_index=True)
+                        
+                        # Smart summary by warehouse
+                        smart_wh_summary = smart_df.groupby('Warehouse').agg({
+                            'Allocated_Units': 'sum',
+                            'Total_Cost': 'sum'
+                        }).reset_index()
+                        smart_wh_summary.columns = ['Warehouse', 'Total Units', 'Total Cost ($)']
+                        smart_wh_summary['Total Units'] = smart_wh_summary['Total Units'].round(0).astype(int)
+                        smart_wh_summary['Total Cost ($)'] = smart_wh_summary['Total Cost ($)'].round(2)
+                        
+                        st.markdown("**Summary by Warehouse (按仓库汇总)**")
+                        st.dataframe(smart_wh_summary, use_container_width=True, hide_index=True)
+                    
+                    # Difference Analysis
+                    st.markdown("---")
+                    st.markdown(f"**🔍 Week {week} Difference Analysis (差异分析)**")
+                    
+                    week_savings = cust_cost - smart_cost
+                    week_savings_pct = (week_savings / cust_cost * 100) if cust_cost > 0 else 0
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric("Cost Difference (成本差异)", f"${week_savings:,.2f}")
+                    with col2:
+                        st.metric("Percentage Saved (节省比例)", f"{week_savings_pct:.1f}%")
+                    with col3:
+                        rate_diff = st.session_state.market_shipping_rate - st.session_state.tms_shipping_rate
+                        st.metric("Rate Advantage (费率优势)", f"${rate_diff:.3f}/unit/100mi")
+                    
+                    # Compare warehouse usage
+                    st.markdown("**Warehouse Usage Comparison (仓库使用对比)**")
+                    
+                    # Merge customer and smart warehouse summaries
+                    cust_wh_summary['Plan'] = 'Customer'
+                    smart_wh_summary['Plan'] = 'Smart'
+                    
+                    combined = pd.concat([
+                        cust_wh_summary[['Warehouse', 'Total Units', 'Plan']],
+                        smart_wh_summary[['Warehouse', 'Total Units', 'Plan']]
+                    ])
+                    
+                    fig_wh = px.bar(combined, x='Warehouse', y='Total Units', color='Plan',
+                                   barmode='group',
+                                   title=f'Week {week} - Warehouse Usage Comparison',
+                                   color_discrete_map={'Customer': '#EF4444', 'Smart': '#10B981'})
+                    fig_wh.update_layout(template='plotly_white', font=dict(family="Inter, sans-serif"))
+                    st.plotly_chart(fig_wh, use_container_width=True)
+                    
+                    # Key Insights
+                    st.markdown("**💡 Key Insights (关键洞察)**")
+                    
+                    insights = []
+                    
+                    # Compare warehouse counts
+                    cust_wh_count = len(cust_wh_summary)
+                    smart_wh_count = len(smart_wh_summary)
+                    
+                    if smart_wh_count < cust_wh_count:
+                        insights.append(f"✅ Smart solution uses **{smart_wh_count} warehouses** vs customer's {cust_wh_count}, improving efficiency (智能方案使用更少仓库，提升效率)")
+                    elif smart_wh_count > cust_wh_count:
+                        insights.append(f"📊 Smart solution leverages **{smart_wh_count} warehouses** for better distribution (智能方案使用更多仓库优化配送)")
+                    
+                    # Rate advantage
+                    if rate_diff > 0:
+                        insights.append(f"💰 TMS rate is **${rate_diff:.3f} ({(rate_diff/st.session_state.market_shipping_rate*100):.1f}%)** lower than market rate (TMS费率优势)")
+                    
+                    # Distance optimization
+                    cust_avg_dist = customer_df['Distance_Miles'].mean()
+                    smart_avg_dist = smart_df['Distance_Miles'].mean()
+                    dist_diff = cust_avg_dist - smart_avg_dist
+                    
+                    if dist_diff > 0:
+                        insights.append(f"🚚 Smart solution reduces average distance by **{dist_diff:.1f} miles** ({(dist_diff/cust_avg_dist*100):.1f}%) (平均距离缩短)")
+                    
+                    for insight in insights:
+                        st.markdown(f"- {insight}")
+                    
+                    if not insights:
+                        st.info("Both plans have similar efficiency patterns (两方案效率相近)")
+                
+                else:
+                    st.warning(f"⚠️ Missing data for Week {week}. Please run both calculations. (第{week}周数据缺失，请运行两个计算)")
+    
+
+
+
+# Data Management Page  
+elif page == "📁 Data Management":
+    st.header("📁 Data Management")
+    st.markdown("*数据管理*")
+    
+    # Export
+    st.subheader("💾 Export Configuration (导出配置)")
+    
+    if st.button("Export All Configuration as JSON (导出全部配置为JSON)"):
+        config = {
+            'warehouses': st.session_state.warehouses.to_dict('records'),
+            'distribution_centers': st.session_state.distribution_centers.to_dict('records'),
+            'demand_forecast': st.session_state.demand_forecast.to_dict('records'),
+            'market_shipping_rate': st.session_state.market_shipping_rate,
+            'tms_shipping_rate': st.session_state.tms_shipping_rate,
+            'customer_allocation_plan': st.session_state.customer_allocation_plan.to_dict('records')
+        }
+        
+        json_str = json.dumps(config, indent=2)
+        st.download_button(
+            label="⬇️ Download Configuration File (下载配置文件)",
+            data=json_str,
+            file_name="warehouse_config.json",
+            mime="application/json"
+        )
+    
+    # Import
+    st.markdown("---")
+    st.subheader("📤 Import Configuration (导入配置)")
+    
+    uploaded_config = st.file_uploader("Upload Configuration JSON (上传配置JSON)", type=['json'])
+    if uploaded_config:
+        try:
+            config = json.load(uploaded_config)
+            
+            st.session_state.warehouses = pd.DataFrame(config['warehouses'])
+            st.session_state.distribution_centers = pd.DataFrame(config['distribution_centers'])
+            st.session_state.demand_forecast = pd.DataFrame(config['demand_forecast'])
+            st.session_state.market_shipping_rate = config.get('market_shipping_rate', 0.18)
+            st.session_state.tms_shipping_rate = config.get('tms_shipping_rate', 0.12)
+            
+            if 'customer_allocation_plan' in config:
+                st.session_state.customer_allocation_plan = pd.DataFrame(config['customer_allocation_plan'])
+            
+            st.success("✅ Configuration imported successfully! (配置导入成功!)")
+            st.rerun()
+        except Exception as e:
+            st.error(f"❌ Import failed (导入失败): {e}")
+
+# Footer
+st.markdown("---")
+st.markdown("**© 2024 Smart Warehouse Allocation System | Optimize logistics, reduce costs, improve efficiency**")
+st.markdown("*优化物流，降低成本，提升效率*")
+                            'Total_Cost': 'sum'
+                        }).reset_index()
+                        cust_wh_summary.columns = ['Warehouse', 'Total Units', 'Total Cost ($)']
+                        cust_wh_summary['Total Units'] = cust_wh_summary['Total Units'].round(0).astype(int)
+                        cust_wh_summary['Total Cost ($)'] = cust_wh_summary['Total Cost ($)'].round(2)
+                        
+                        st.markdown("**Summary by Warehouse (按仓库汇总)**")
+                        st.dataframe(cust_wh_summary, use_container_width=True, hide_index=True)
+                    
+                    with col2:
+                        st.markdown("**💡 Smart Suggestion (智能建议)**")
+                        st.info(f"Total Cost: ${smart_cost:,.2f} | TMS Rate: ${st.session_state.tms_shipping_rate:.3f}/unit/100mi")
+                        
+                        # Prepare smart data for display
+                        smart_display = smart_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
+                        smart_display = smart_df[['Product', 'Warehouse', 'Channel', 'State', 'Allocated_Units', 'Allocated_Shipped', 'Cost_Per_Unit', 'Distance_Miles', 'Total_Cost']].copy()
+                        smart_display['Allocated_Units'] = smart_display['Allocated_Units'].round(0).astype(int)
+                        smart_display['Allocated_Shipped'] = smart_display['Allocated_Shipped'].round(0).astype(int)
                         smart_display['Cost_Per_Unit'] = smart_display['Cost_Per_Unit'].apply(lambda x: f"${x:.4f}")
                         smart_display['Distance_Miles'] = smart_display['Distance_Miles'].round(1)
                         smart_display['Total_Cost'] = smart_display['Total_Cost'].apply(lambda x: f"${x:,.2f}")
                         
                         smart_display.columns = ['Product', 'Warehouse', 'Channel', 'State', 'Units', 'Rate ($/unit)', 'Distance (mi)', 'Cost']
+                        smart_display.columns = ['Product', 'Warehouse', 'Channel', 'State', 'Units', 'Shipped', 'Rate ($/unit)', 'Distance (mi)', 'Cost']
                         
                         st.dataframe(smart_display, use_container_width=True, hide_index=True)
                         
