@@ -9,6 +9,7 @@ from geopy.geocoders import Nominatim
 import json
 from io import BytesIO
 import time
+import db  # SQLite数据库模块
 
 # Page configuration
 st.set_page_config(
@@ -106,63 +107,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state with new structure
-if 'warehouses' not in st.session_state:
-    st.session_state.warehouses = pd.DataFrame({
-        'Name': ['EL PASO', 'Valley View', 'Seabrook', 'Cesanek'],
-        'Address': [
-            '12100 Emerald Pass Drive, El Paso, TX 79936',
-            '6800 Valley View St, Buena Park, CA 90620',
-            '300 Seabrook Parkway, Pooler, GA 31322',
-            '175 Cesanek Rd., Northampton, PA 18067'
-        ],
-        'Current_Inventory': [500, 600, 400, 300],          # Low current inventory
-        'Incoming_Week3': [200, 300, 150, 200],             # Small incoming Week 3
-        'Incoming_Week4': [250, 350, 200, 250],             # Small incoming Week 4
-        'Outgoing_Week1': [300, 400, 200, 150],             # Week 1 outgoing
-        'Outgoing_Week2': [350, 450, 250, 200],             # Week 2 outgoing
-        'Capacity': [10000, 12000, 9000, 11000],            # High capacity for shipping
-    })
-
-if 'distribution_centers' not in st.session_state:
-    st.session_state.distribution_centers = pd.DataFrame({
-        'Channel': ['Amazon', 'Walmart', 'Target', 'Amazon'],
-        'State': ['CA', 'TX', 'GA', 'PA'],
-        'Address': ['San Francisco, CA', 'Dallas, TX', 'Atlanta, GA', 'Philadelphia, PA']
-    })
-
-if 'demand_forecast' not in st.session_state:
-    st.session_state.demand_forecast = pd.DataFrame({
-        'Product': ['32Q21K', '32Q21K', '32Q21K', '32Q21K'],
-        'Channel': ['Amazon', 'Walmart', 'Target', 'Amazon'],
-        'State': ['CA', 'TX', 'GA', 'PA'],
-        'Demand_Week3': [2200, 1800, 1600, 1900],           # Total: 7,500
-        'Demand_Week4': [2300, 1900, 1700, 2000]            # Total: 7,900
-    })
-
-# Shipping rates - Market (customer current) vs TMS (smart suggestion)
-if 'market_shipping_rate' not in st.session_state:
-    st.session_state.market_shipping_rate = 0.18  # $/unit/100miles
-
-if 'tms_shipping_rate' not in st.session_state:
-    st.session_state.tms_shipping_rate = 0.12  # $/unit/100miles (better rate)
-
-if 'customer_allocation_plan' not in st.session_state:
-    # Initialize with customer default warehouses
-    st.session_state.customer_allocation_plan = pd.DataFrame({
-        'Product': ['32Q21K', '32Q21K', '32Q21K', '32Q21K'],
-        'Warehouse': ['Valley View', 'EL PASO', 'EL PASO', 'Cesanek'],
-        'Channel': ['Amazon', 'Walmart', 'Target', 'Amazon'],
-        'State': ['CA', 'TX', 'GA', 'PA'],
-        'Allocated_Units_Week3': [2200, 1800, 1600, 1900],
-        'Allocated_Units_Week4': [2300, 1900, 1700, 2000]
-    })
-
-if 'customer_plan_mode' not in st.session_state:
-    st.session_state.customer_plan_mode = 'auto'  # 'auto' or 'manual'
-
-if 'customer_selected_warehouses' not in st.session_state:
+# Initialize session state from SQLite database
+if 'db_initialized' not in st.session_state:
+    data = db.load_all_data()
+    
+    st.session_state.warehouses = data['warehouses'].copy()
+    st.session_state.distribution_centers = data['distribution_centers'].copy()
+    st.session_state.demand_forecast = data['demand_forecast'].copy()
+    st.session_state.customer_allocation_plan = data['customer_allocation_plan'].copy()
+    st.session_state.carriers = data['carriers'].copy()
+    st.session_state.rates = data['rates'].copy()
+    st.session_state.sku = data['sku'].copy()
+    st.session_state.warehouse_inventory = data['warehouse_inventory'].copy()
+    st.session_state.vehicles = data['vehicles'].copy()
+    st.session_state.market_shipping_rate = data['market_shipping_rate']
+    st.session_state.tms_shipping_rate = data['tms_shipping_rate']
     st.session_state.customer_selected_warehouses = st.session_state.warehouses['Name'].tolist()
+    st.session_state.db_initialized = True
 
 
 @st.cache_data
@@ -256,34 +217,51 @@ def calculate_shipping_costs(distance_matrix, rate_per_unit_per_100miles):
 
 def calculate_available_inventory(week):
     """
-    Calculate available inventory for a specific week (中文: 计算特定周的可用库存)
+    Calculate available inventory for a specific week using warehouse schedule
     Week 3 or Week 4
     """
-    warehouses = st.session_state.warehouses
+    # Get warehouse schedule from session state (loaded from DB)
+    schedule = st.session_state.get('warehouse_schedule', pd.DataFrame())
     
-    inventory = warehouses[['Name', 'Current_Inventory']].copy()
+    if schedule.empty:
+        # Return empty inventory if no schedule
+        warehouses = st.session_state.warehouses
+        return warehouses[['Name']].copy().assign(Available=0)
     
-    if week == 3:
-        # Week 3: Current + Incoming_Week3 - Outgoing_Week1 - Outgoing_Week2
-        inventory['Available'] = (
-            warehouses['Current_Inventory'] +
-            warehouses['Incoming_Week3'] -
-            warehouses['Outgoing_Week1'] -
-            warehouses['Outgoing_Week2']
-        )
-    elif week == 4:
-        # Week 4: Current + Incoming_Week3 + Incoming_Week4 - Outgoing_Week1 - Outgoing_Week2
-        inventory['Available'] = (
-            warehouses['Current_Inventory'] +
-            warehouses['Incoming_Week3'] +
-            warehouses['Incoming_Week4'] -
-            warehouses['Outgoing_Week1'] -
-            warehouses['Outgoing_Week2']
-        )
-    else:
-        inventory['Available'] = warehouses['Current_Inventory']
+    # Get inventory data
+    inventory_df = st.session_state.get('warehouse_inventory', pd.DataFrame())
     
-    return inventory
+    # Calculate available for each warehouse
+    result = []
+    for wh in schedule['Warehouse'].unique():
+        wh_schedule = schedule[schedule['Warehouse'] == wh]
+        
+        for _, row in wh_schedule.iterrows():
+            sku = row.get('SKU', '32Q21K')
+            
+            # Get current inventory
+            inv_match = inventory_df[(inventory_df['warehouse_name'] == wh) & (inventory_df['sku_code'] == sku)]
+            current_inv = inv_match['quantity_on_hand'].sum() if not inv_match.empty else 0
+            
+            in_w3 = row.get('Incoming_Week3', 0)
+            in_w4 = row.get('Incoming_Week4', 0)
+            out_w1 = row.get('Outgoing_Week1', 0)
+            out_w2 = row.get('Outgoing_Week2', 0)
+            
+            if week == 3:
+                available = current_inv + in_w3 - out_w1 - out_w2
+            elif week == 4:
+                available = current_inv + in_w3 + in_w4 - out_w1 - out_w2
+            else:
+                available = current_inv
+            
+            result.append({
+                'Name': wh,
+                'SKU': sku,
+                'Available': max(0, available)
+            })
+    
+    return pd.DataFrame(result)
 
 
 def solve_lp_with_inventory(allocation_df, inventory_df, warehouses_df, ignore_capacity=False):
@@ -691,12 +669,14 @@ if page == "📊 Configuration":
         st.success(st.session_state.success_msg)
         del st.session_state.success_msg
     
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Warehouses (仓库)", 
-        "Distribution Centers (配送中心)", 
-        "Demand Forecast (需求预测)", 
-        "Shipping Rates (运费)",
-        "Customer Current Plan (客户当前方案)"
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        "🏭 Warehouses (仓库)", 
+        "📍 DC (配送中心)",
+        "📦 SKU (产品)",
+        "🚚 Carriers & Rates (承运商费率)",
+        "📊 Inventory & Schedule (库存与调度)",
+        "📈 Demand Forecast (需求预测)",
+        "💼 Customer Plan (客户方案)"
     ])
     
     with tab1:
@@ -710,11 +690,6 @@ if page == "📊 Configuration":
         summary_row = pd.DataFrame({
             'Name': ['** TOTAL **'],
             'Address': ['All Warehouses'],
-            'Current_Inventory': [st.session_state.warehouses['Current_Inventory'].sum()],
-            'Incoming_Week3': [st.session_state.warehouses['Incoming_Week3'].sum()],
-            'Incoming_Week4': [st.session_state.warehouses['Incoming_Week4'].sum()],
-            'Outgoing_Week1': [st.session_state.warehouses['Outgoing_Week1'].sum()],
-            'Outgoing_Week2': [st.session_state.warehouses['Outgoing_Week2'].sum()],
             'Capacity': [st.session_state.warehouses['Capacity'].sum()]
         })
         display_wh_with_summary = pd.concat([display_wh, summary_row], ignore_index=True)
@@ -724,12 +699,7 @@ if page == "📊 Configuration":
         st.markdown("---")
         
         with st.expander("✏️ Edit Warehouses (编辑仓库)", expanded=False):
-            st.markdown("""
-            **Instructions (操作说明)**:
-            - Edit inventory levels (编辑库存水平)
-            - Week 1 & 2: Outgoing inventory (第1-2周: 出库)
-            - Week 3 & 4: Incoming inventory (第3-4周: 入库)
-            """)
+            st.markdown("**Note: Inventory is managed in 'Inventory' tab**")
             
             edited_wh = st.data_editor(
                 st.session_state.warehouses,
@@ -738,11 +708,6 @@ if page == "📊 Configuration":
                 column_config={
                     "Name": st.column_config.TextColumn("Warehouse Name (仓库名)", required=True),
                     "Address": st.column_config.TextColumn("Address (地址)", required=True),
-                    "Current_Inventory": st.column_config.NumberColumn("Current Inventory (当前库存)", min_value=0, step=100),
-                    "Incoming_Week3": st.column_config.NumberColumn("Incoming Week 3 (第3周入库)", min_value=0, step=50),
-                    "Incoming_Week4": st.column_config.NumberColumn("Incoming Week 4 (第4周入库)", min_value=0, step=50),
-                    "Outgoing_Week1": st.column_config.NumberColumn("Outgoing Week 1 (第1周出库)", min_value=0, step=50),
-                    "Outgoing_Week2": st.column_config.NumberColumn("Outgoing Week 2 (第2周出库)", min_value=0, step=50),
                     "Capacity": st.column_config.NumberColumn("Max Capacity (最大容量)", min_value=0, step=100)
                 }
             )
@@ -750,8 +715,9 @@ if page == "📊 Configuration":
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("💾 Save Changes (保存更改)", type="primary", use_container_width=True):
+                    db.save_warehouses_df(edited_wh)
                     st.session_state.warehouses = edited_wh
-                    st.session_state.success_msg = "✅ Warehouses saved successfully! (仓库已保存!)"
+                    st.session_state.success_msg = "✅ Warehouses saved successfully!"
                     st.rerun()
             
             with col2:
@@ -764,11 +730,6 @@ if page == "📊 Configuration":
                             '300 Seabrook Parkway, Pooler, GA 31322',
                             '175 Cesanek Rd., Northampton, PA 18067'
                         ],
-                        'Current_Inventory': [500, 600, 400, 300],
-                        'Incoming_Week3': [200, 300, 150, 200],
-                        'Incoming_Week4': [250, 350, 200, 250],
-                        'Outgoing_Week1': [300, 400, 200, 150],
-                        'Outgoing_Week2': [350, 450, 250, 200],
                         'Capacity': [10000, 12000, 9000, 11000]
                     })
                     st.session_state.success_msg = "✅ Warehouses reset to default! (仓库已恢复默认!)"
@@ -794,7 +755,6 @@ if page == "📊 Configuration":
             # Add summary row
             summary_row = pd.DataFrame({
                 'Name': ['** TOTAL **'],
-                'Current_Inventory': [st.session_state.warehouses['Current_Inventory'].sum()],
                 'Available': [inv3['Available'].sum()]
             })
             inv3_display = pd.concat([inv3, summary_row], ignore_index=True)
@@ -823,7 +783,6 @@ if page == "📊 Configuration":
             # Add summary row
             summary_row = pd.DataFrame({
                 'Name': ['** TOTAL **'],
-                'Current_Inventory': [st.session_state.warehouses['Current_Inventory'].sum()],
                 'Available': [inv4['Available'].sum()]
             })
             inv4_display = pd.concat([inv4, summary_row], ignore_index=True)
@@ -892,7 +851,194 @@ if page == "📊 Configuration":
                     st.session_state.success_msg = "✅ Distribution Centers reset! (配送中心已恢复默认!)"
                     st.rerun()
     
+    # ======== NEW: SKU Management Tab ========
     with tab3:
+        st.subheader("SKU Management (SKU维护)")
+        
+        st.info("💡 维护产品SKU的尺寸和重量信息，用于计算运费")
+        
+        # Display current SKUs
+        st.markdown("**Current SKUs (当前SKU列表)**")
+        
+        sku_display = st.session_state.sku.copy()
+        if not sku_display.empty:
+            # Add volumetric weight column
+            sku_display['Dim_Weight'] = (sku_display['length_in'] * sku_display['width_in'] * sku_display['height_in']) / 139
+            st.dataframe(sku_display, use_container_width=True)
+            
+            # Summary
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total SKUs", len(sku_display))
+            with col2:
+                st.metric("Avg Weight", f"{sku_display['weight_lbs'].mean():.1f} lbs")
+        else:
+            st.warning("No SKUs found")
+        
+        st.markdown("---")
+        
+        # Add new SKU form
+        with st.expander("➕ Add New SKU (添加新SKU)", expanded=False):
+            with st.form("add_sku_form"):
+                col1, col2 = st.columns(2)
+                with col1:
+                    new_sku_code = st.text_input("SKU Code (SKU编码)", placeholder="e.g., SKU-001")
+                    new_sku_name = st.text_input("Product Name (产品名称)", placeholder="e.g., Widget A")
+                    new_length = st.number_input("Length (inches)", min_value=0.1, value=12.0)
+                with col2:
+                    new_width = st.number_input("Width (inches)", min_value=0.1, value=8.0)
+                    new_height = st.number_input("Height (inches)", min_value=0.1, value=6.0)
+                    new_weight = st.number_input("Weight (lbs)", min_value=0.1, value=5.0)
+                    new_unit_type = st.selectbox("Unit Type (单位类型)", ["each", "case", "pallet"])
+                
+                submit_sku = st.form_submit_button("💾 Add SKU", type="primary")
+                
+                if submit_sku:
+                    if new_sku_code:
+                        success, msg = db.add_sku(new_sku_code, new_sku_name, new_length, new_width, new_height, new_weight, new_unit_type)
+                        if success:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.error("SKU Code is required")
+        
+        # Edit/Delete SKU
+        with st.expander("✏️ Edit/Delete SKU (编辑/删除SKU)", expanded=False):
+            if not st.session_state.sku.empty:
+                # Let user select SKU to edit
+                sku_options = {f"{row['sku_code']} - {row['name']}": row['id'] for _, row in st.session_state.sku.iterrows()}
+                selected_sku = st.selectbox("Select SKU to Edit", options=list(sku_options.keys()))
+                
+                if selected_sku:
+                    sku_id = sku_options[selected_sku]
+                    sku_row = st.session_state.sku[st.session_state.sku['id'] == sku_id].iloc[0]
+                    
+                    with st.form("edit_sku_form"):
+                        edit_sku_code = st.text_input("SKU Code", value=sku_row['sku_code'])
+                        edit_sku_name = st.text_input("Product Name", value=sku_row['name'] if pd.notna(sku_row['name']) else "")
+                        edit_length = st.number_input("Length (inches)", value=float(sku_row['length_in']))
+                        edit_width = st.number_input("Width (inches)", value=float(sku_row['width_in']))
+                        edit_height = st.number_input("Height (inches)", value=float(sku_row['height_in']))
+                        edit_weight = st.number_input("Weight (lbs)", value=float(sku_row['weight_lbs']))
+                        edit_unit = st.selectbox("Unit Type", ["each", "case", "pallet"], 
+                                                 index=["each", "case", "pallet"].index(sku_row['unit_type']) if sku_row['unit_type'] in ["each", "case", "pallet"] else 0)
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            save_sku = st.form_submit_button("💾 Save Changes", type="primary")
+                        with col2:
+                            delete_sku = st.form_submit_button("🗑️ Delete SKU")
+                        
+                        if save_sku:
+                            db.update_sku(sku_id, edit_sku_code, edit_sku_name, edit_length, edit_width, edit_height, edit_weight, edit_unit)
+                            st.success("SKU updated!")
+                            st.rerun()
+                        
+                        if delete_sku:
+                            db.delete_sku(sku_id)
+                            st.success("SKU deleted!")
+                            st.rerun()
+
+    # ======== NEW: Carrier & Rates Tab ========
+    with tab4:
+        st.subheader("Carrier & Rates (承运商费率)")
+        
+        st.info("💡 维护承运商和运费费率，支持FTL/LTL/Container模式")
+        
+        # Display Carriers
+        st.markdown("**Carriers (承运商)**")
+        carriers_df = st.session_state.carriers
+        if not carriers_df.empty:
+            st.dataframe(carriers_df, use_container_width=True)
+        
+        # Add new Carrier
+        with st.expander("➕ Add Carrier (添加承运商)", expanded=False):
+            with st.form("add_carrier_form"):
+                carrier_name = st.text_input("Carrier Name (承运商名称)", placeholder="e.g., UPS, FedEx, XPO")
+                carrier_mode = st.selectbox("Mode (运输模式)", ["FTL", "LTL", "Container"])
+                carrier_desc = st.text_input("Description (描述)", placeholder="e.g., Less Than Truckload")
+                
+                submit_carrier = st.form_submit_button("💾 Add Carrier", type="primary")
+                
+                if submit_carrier:
+                    if carrier_name:
+                        success, msg = db.add_carrier(carrier_name, carrier_mode, carrier_desc)
+                        if success:
+                            st.success(msg)
+                            st.rerun()
+                        else:
+                            st.error(msg)
+                    else:
+                        st.error("Carrier Name is required")
+        
+        st.markdown("---")
+        
+        # Display Rates
+        st.markdown("**Rates (费率表)**")
+        rates_df = st.session_state.rates
+        if not rates_df.empty:
+            display_rates = rates_df.copy()
+            display_rates['rate_range'] = display_rates.apply(
+                lambda x: f"{x['min_distance']:.0f}-{x['max_distance']:.0f}", axis=1
+            )
+            st.dataframe(display_rates[['carrier_name', 'mode', 'rate_range', 'rate_per_mile', 'minimum_charge', 'fixed_cost']], 
+                        use_container_width=True)
+            
+            # Summary
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Carriers", carriers_df['name'].nunique() if not carriers_df.empty else 0)
+            with col2:
+                st.metric("Total Rate Rules", len(rates_df))
+            with col3:
+                avg_rate = rates_df['rate_per_mile'].mean() if not rates_df.empty else 0
+                st.metric("Avg Rate/mile", f"${avg_rate:.2f}")
+        
+        # Add new Rate
+        with st.expander("➕ Add Rate Rule (添加费率规则)", expanded=False):
+            if not carriers_df.empty:
+                with st.form("add_rate_form"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        # Carrier selection
+                        carrier_options = {f"{row['name']} ({row['mode']})": row['id'] for _, row in carriers_df.iterrows()}
+                        selected_carrier = st.selectbox("Select Carrier", options=list(carrier_options.keys()))
+                        min_dist = st.number_input("Min Distance (miles)", min_value=0, value=0)
+                        max_dist = st.number_input("Max Distance (miles)", min_value=1, value=500)
+                    with col2:
+                        rate_per_mile = st.number_input("Rate per Mile ($)", min_value=0.0, value=2.5, step=0.1)
+                        minimum = st.number_input("Minimum Charge ($)", min_value=0.0, value=25.0)
+                        fixed_cost = st.number_input("Fixed Cost ($)", min_value=0.0, value=15.0)
+                    
+                    submit_rate = st.form_submit_button("💾 Add Rate", type="primary")
+                    
+                    if submit_rate:
+                        if selected_carrier:
+                            carrier_id = carrier_options[selected_carrier]
+                            db.add_rate(carrier_id, min_dist, max_dist, rate_per_mile, minimum, fixed_cost)
+                            st.success("Rate added!")
+                            st.rerun()
+                        else:
+                            st.error("Please select a carrier")
+            else:
+                st.warning("Please add a carrier first")
+        
+        # Delete Rate
+        with st.expander("🗑️ Delete Rate Rule", expanded=False):
+            if not rates_df.empty:
+                rate_options = {f"{row['carrier_name']} ({row['min_distance']}-{row['max_distance']} mi, ${row['rate_per_mile']}/mi)": row['id'] 
+                              for _, row in rates_df.iterrows()}
+                selected_rate = st.selectbox("Select Rate to Delete", options=list(rate_options.keys()))
+                
+                if st.button("Delete Selected Rate", type="primary"):
+                    db.delete_rate(rate_options[selected_rate])
+                    st.success("Rate deleted!")
+                    st.rerun()
+
+    # ======== Original tab3 -> now tab5 ========
+    with tab5:
         st.subheader("Demand Forecast (需求预测)")
         
         # Display current demand
@@ -958,71 +1104,275 @@ if page == "📊 Configuration":
             total_w4 = st.session_state.demand_forecast['Demand_Week4'].sum()
             st.metric("Total Week 4 Demand (第4周总需求)", f"{total_w4:,}")
     
-    with tab4:
-        st.subheader("Shipping Rates Configuration (运费配置)")
+    # ======== NEW: Inventory Tab ========
+    with tab6:
+        st.subheader("Warehouse Inventory & Schedule (仓库库存与调度)")
         
-        st.markdown("""
-        **Two Rate Types (两种费率类型)**:
-        - **Market Rates**: Used for customer current plan (客户当前方案使用的市场费率)
-        - **TMS Rates**: Used for smart suggestion (智能方案使用的TMS优惠费率)
-        """)
+        st.info("💡 按仓库+SKU维护库存和入/出库计划")
+        
+        # Load warehouse schedule
+        if 'warehouse_schedule' not in st.session_state:
+            st.session_state.warehouse_schedule = db.get_warehouse_schedule()
+        
+        # Display warehouse schedule
+        st.markdown("**Warehouse Schedule (仓库调度计划)**")
+        
+        schedule_df = st.session_state.warehouse_schedule
+        if not schedule_df.empty:
+            st.dataframe(schedule_df, use_container_width=True)
+            
+            # Calculate available inventory
+            st.markdown("---")
+            st.markdown("**📊 Available Inventory Projection (可用库存预测)**")
+            
+            # Calculate available for each warehouse-SKU
+            warehouses_list = st.session_state.warehouses['Name'].tolist()
+            skus_list = st.session_state.sku['sku_code'].tolist()
+            
+            available_data = []
+            for wh in warehouses_list:
+                for sku in skus_list:
+                    avail_w3 = db.calculate_available_inventory(wh, sku, 3)
+                    avail_w4 = db.calculate_available_inventory(wh, sku, 4)
+                    available_data.append({
+                        'Warehouse': wh,
+                        'SKU': sku,
+                        'Available_Week3': avail_w3,
+                        'Available_Week4': avail_w4
+                    })
+            
+            avail_df = pd.DataFrame(available_data)
+            if not avail_df.empty:
+                # Add totals
+                total_row = pd.DataFrame([{
+                    'Warehouse': '**TOTAL**',
+                    'SKU': '',
+                    'Available_Week3': avail_df['Available_Week3'].sum(),
+                    'Available_Week4': avail_df['Available_Week4'].sum()
+                }])
+                avail_df = pd.concat([avail_df, total_row], ignore_index=True)
+                st.dataframe(avail_df, use_container_width=True)
+        else:
+            st.warning("No schedule records found")
+        
+        st.markdown("---")
+        
+        # Add/Update Schedule
+        with st.expander("➕ Add/Update Schedule (添加/更新调度)", expanded=False):
+            warehouses = st.session_state.warehouses['Name'].tolist()
+            skus = st.session_state.sku['sku_code'].tolist()
+            
+            if warehouses and skus:
+                with st.form("add_schedule_form"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        sch_wh = st.selectbox("Warehouse (仓库)", warehouses, key="sch_wh")
+                        sch_sku = st.selectbox("SKU Code", skus, key="sch_sku")
+                        current_inv = st.number_input("Current Inventory (当前库存)", min_value=0, value=500)
+                    with col2:
+                        in_w3 = st.number_input("Incoming Week 3 (第3周入库)", min_value=0, value=200)
+                        in_w4 = st.number_input("Incoming Week 4 (第4周入库)", min_value=0, value=250)
+                        out_w1 = st.number_input("Outgoing Week 1 (第1周出库)", min_value=0, value=300)
+                        out_w2 = st.number_input("Outgoing Week 2 (第2周出库)", min_value=0, value=350)
+                    
+                    submit_sch = st.form_submit_button("💾 Save Schedule", type="primary")
+                    
+                    if submit_sch:
+                        db.save_warehouse_schedule(sch_wh, sch_sku, in_w3, in_w4, out_w1, out_w2)
+                        db.update_warehouse_inventory(sch_wh, sch_sku, current_inv, 0)
+                        st.session_state.warehouse_schedule = db.get_warehouse_schedule()
+                        st.success("Schedule and inventory updated!")
+                        st.rerun()
+            else:
+                st.warning("Please add warehouses and SKUs first")
+
+    # ======== Legacy Settings - keep for backward compatibility ========
+    with st.expander("⚙️ Legacy Settings (旧设置)", expanded=False):
+        st.info("💡 Legacy rate settings - now managed in 'Carrier & Rates' tab")
         
         col1, col2 = st.columns(2)
         
         with col1:
-            st.markdown("**📦 Market Shipping Rates (市场运费)**")
+            st.markdown("**📦 Market Rate**")
             market_rate = st.number_input(
-                "Market Rate ($/unit/100 miles) - 市场费率",
+                "Market Rate",
                 min_value=0.01,
                 max_value=1.0,
-                value=st.session_state.market_shipping_rate,
+                value=float(st.session_state.market_shipping_rate),
                 step=0.01,
-                key="market_rate_input",
-                help="Used for customer current cost calculation (用于客户当前成本计算)"
+                key="market_rate_legacy"
             )
             st.session_state.market_shipping_rate = market_rate
-            st.info(f"Current: ${market_rate}/unit/100mi")
         
         with col2:
-            st.markdown("**🚚 TMS Shipping Rates (TMS运费)**")
+            st.markdown("**🚚 TMS Rate**")
             tms_rate = st.number_input(
-                "TMS Rate ($/unit/100 miles) - TMS费率",
+                "TMS Rate",
                 min_value=0.01,
                 max_value=1.0,
-                value=st.session_state.tms_shipping_rate,
+                value=float(st.session_state.tms_shipping_rate),
                 step=0.01,
-                key="tms_rate_input",
-                help="Used for smart suggestion calculation (用于智能方案成本计算)"
+                key="tms_rate_legacy"
             )
             st.session_state.tms_shipping_rate = tms_rate
-            st.info(f"Current: ${tms_rate}/unit/100mi")
+        
+        if st.button("Save Legacy Rates"):
+            db.save_setting('market_shipping_rate', str(market_rate))
+            db.save_setting('tms_shipping_rate', str(tms_rate))
+            st.success("Legacy rates saved!")
+    
+    # ======== Customer Plan Tab ========
+    with tab7:
+        st.subheader("Customer Current Plan Configuration (客户当前方案配置)")
+        
+        # Load customer settings
+        if 'customer_settings' not in st.session_state:
+            st.session_state.customer_settings = db.get_customer_settings()
+        
+        carriers_df = st.session_state.carriers
+        vehicles_df = st.session_state.get('vehicles', pd.DataFrame())
+        
+        # Prepare carrier options
+        customer_carrier_options = {}
+        tms_carrier_options = {}
+        selected_customer_carrier = None
+        selected_tms_carrier = None
+        
+        if not carriers_df.empty:
+            customer_carrier_options = {f"{row['name']} ({row['mode']})": row['id'] for _, row in carriers_df.iterrows()}
+            # TMS carrier dropdown - only show TMS carriers
+            tms_carrier_options = {f"{row['name']} ({row['mode']})": row['id'] for _, row in carriers_df.iterrows() if row['name'] == 'TMS'}
+        
+        # ======== Section 1: Carrier Selection ========
+        st.markdown("### 🚚 Carrier Selection (选择承运商)")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Customer Carrier (客户当前使用的承运商)**")
+            if customer_carrier_options:
+                current_customer_carrier = st.session_state.customer_settings.iloc[0] if not st.session_state.customer_settings.empty else None
+                default_customer = None
+                if current_customer_carrier is not None:
+                    for k, v in customer_carrier_options.items():
+                        if v == current_customer_carrier.get('customer_carrier_id'):
+                            default_customer = k
+                            break
+                
+                selected_customer_carrier = st.selectbox(
+                    "Select Customer Carrier",
+                    options=list(customer_carrier_options.keys()),
+                    index=list(customer_carrier_options.keys()).index(default_customer) if default_customer else 0,
+                    key="customer_carrier_select"
+                )
+            else:
+                st.warning("No carriers available")
+        
+        with col2:
+            st.markdown("**TMS Carrier (系统优化使用的承运商)**")
+            if tms_carrier_options:
+                current_tms_carrier = st.session_state.customer_settings.iloc[0] if not st.session_state.customer_settings.empty else None
+                default_tms = None
+                if current_tms_carrier is not None:
+                    for k, v in tms_carrier_options.items():
+                        if v == current_tms_carrier.get('tms_carrier_id'):
+                            default_tms = k
+                            break
+                
+                selected_tms_carrier = st.selectbox(
+                    "Select TMS Carrier",
+                    options=list(tms_carrier_options.keys()),
+                    index=list(tms_carrier_options.keys()).index(default_tms) if default_tms else 0,
+                    key="tms_carrier_select"
+                )
+            else:
+                st.warning("No carriers available")
+        
+        # Save carrier selection
+        if customer_carrier_options and selected_customer_carrier:
+            if st.button("💾 Save Carrier Selection", type="primary"):
+                customer_carrier_id = customer_carrier_options.get(selected_customer_carrier)
+                tms_carrier_id = tms_carrier_options.get(selected_tms_carrier)
+                db.save_customer_settings(customer_carrier_id, tms_carrier_id)
+                st.session_state.customer_settings = db.get_customer_settings()
+                st.success("Carriers saved!")
+                st.rerun()
         
         st.markdown("---")
         
-        rate_diff = market_rate - tms_rate
-        rate_diff_pct = (rate_diff / market_rate * 100) if market_rate > 0 else 0
+        # ======== Section 2: Vehicle Selection ========
+        st.markdown("### 🚛 Vehicle Selection (选择车辆)")
         
-        if rate_diff > 0:
-            st.success(f"""
-            ✅ **TMS Rate Advantage (TMS费率优势)**
-            
-            TMS rate is **${rate_diff:.3f}** ({rate_diff_pct:.1f}%) lower than market rate
-            
-            TMS费率比市场费率低 **${rate_diff:.3f}** ({rate_diff_pct:.1f}%)
-            """)
-        elif rate_diff < 0:
-            st.warning(f"⚠️ TMS rate is higher than market rate (TMS费率高于市场费率)")
+        if not vehicles_df.empty:
+            vehicle_options = {row['name']: row['id'] for _, row in vehicles_df.iterrows()}
+            selected_vehicle = st.selectbox(
+                "Select Trailer Size",
+                options=list(vehicle_options.keys()),
+                index=0,
+                key="vehicle_select"
+            )
+            selected_vehicle_id = vehicle_options.get(selected_vehicle)
         else:
-            st.info("ℹ️ TMS rate equals market rate (TMS费率等于市场费率)")
-    
-    with tab5:
-        st.subheader("Customer Current Plan Configuration (客户当前方案配置)")
+            st.warning("No vehicles available")
+            selected_vehicle_id = None
         
-        # Get all available warehouses
+        st.markdown("---")
+        
+        # ======== Section 3: Calculated Rates ========
+        st.markdown("### 💰 Calculated Unit Shipping Rates (计算的单位运费)")
+        
+        # Calculate shipping rates for each warehouse-DC pair
+        if not customer_carrier_options or not tms_carrier_options or st.session_state.sku.empty or st.session_state.warehouses.empty:
+            st.info("Please configure carriers, SKUs, and warehouses first")
+        else:
+            customer_carrier_id = customer_carrier_options.get(selected_customer_carrier)
+            tms_carrier_id = tms_carrier_options.get(selected_tms_carrier)
+            
+            distance_matrix = calculate_distance_matrix()
+            skus_list = st.session_state.sku['sku_code'].tolist()
+            
+            rate_calculation = []
+            for _, dist_row in distance_matrix.iterrows():
+                for sku in skus_list:
+                    # Customer rate
+                    cust_rate, cust_max_units, _ = db.calculate_unit_shipping_rate(sku, dist_row['Distance_Miles'], customer_carrier_id, selected_vehicle_id)
+                    # TMS rate
+                    tms_rate, tms_max_units, _ = db.calculate_unit_shipping_rate(sku, dist_row['Distance_Miles'], tms_carrier_id, selected_vehicle_id)
+                    
+                    rate_calculation.append({
+                        'Warehouse': dist_row['Warehouse'],
+                        'DC': f"{dist_row['DC_Channel']}-{dist_row['DC_State']}",
+                        'SKU': sku,
+                        'Distance': round(dist_row['Distance_Miles'], 0),
+                        f'Max Units / {selected_vehicle}': tms_max_units,
+                        'Customer Rate / ea': round(cust_rate, 4),
+                        'TMS Rate / ea': round(tms_rate, 4),
+                        'Savings / ea': round(cust_rate - tms_rate, 4)
+                    })
+            
+            rate_df = pd.DataFrame(rate_calculation)
+            if not rate_df.empty:
+                st.dataframe(rate_df, use_container_width=True)
+                
+                # Summary
+                avg_cust = rate_df['Customer Rate / ea'].mean()
+                avg_tms = rate_df['TMS Rate / ea'].mean()
+                avg_savings = rate_df['Savings / ea'].mean()
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Avg Customer Rate", f"${avg_cust:.4f}")
+                with col2:
+                    st.metric("Avg TMS Rate", f"${avg_tms:.4f}")
+                with col3:
+                    st.metric("Avg Savings", f"${avg_savings:.4f}")
+        
+        st.markdown("---")
+        
+        # ======== Section 2: Warehouse Selection ========
+        st.markdown("### 📦 Select Customer Warehouses (选择客户仓库)")
+        
         all_warehouses = st.session_state.warehouses['Name'].tolist()
-        
-        # 1. Select Warehouses for Plan
-        st.markdown("**1. Select Customer Warehouses (选择客户仓库)**")
         
         # Get current saved selection, defaulting to all if not set
         current_selection = st.session_state.get('customer_selected_warehouses', all_warehouses)
