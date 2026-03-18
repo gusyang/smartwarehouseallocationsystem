@@ -949,75 +949,8 @@ if page == "📊 Configuration":
                     st.success("Rate deleted!")
                     st.rerun()
 
-    # ======== Original tab3 -> now tab5 ========
-    with tab5:
-        st.subheader("Demand Forecast (需求预测)")
-        
-        # Display current demand
-        st.markdown("**Current Demand Forecast (当前需求预测)**")
-        
-        # Add summary row to demand display
-        demand_display = st.session_state.demand_forecast.copy()
-        summary_row = pd.DataFrame({
-            'Product': ['** TOTAL **'],
-            'Channel': ['All Channels'],
-            'State': ['All States'],
-            'Demand_Week3': [demand_display['Demand_Week3'].sum()],
-            'Demand_Week4': [demand_display['Demand_Week4'].sum()]
-        })
-        demand_with_summary = pd.concat([demand_display, summary_row], ignore_index=True)
-        
-        st.dataframe(demand_with_summary, use_container_width=True, hide_index=True)
-        
-        st.markdown("---")
-        
-        with st.expander("✏️ Edit Demand Forecast (编辑需求预测)", expanded=False):
-            st.info("💡 Enter demand for Week 3 and Week 4 only (仅输入第3周和第4周的需求)")
-            
-            edited_demand = st.data_editor(
-                st.session_state.demand_forecast,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Product": st.column_config.TextColumn("Product (产品)"),
-                    "Channel": st.column_config.TextColumn("Channel (渠道)"),
-                    "State": st.column_config.TextColumn("State (州)"),
-                    "Demand_Week3": st.column_config.NumberColumn("Week 3 Demand (第3周需求)", min_value=0, step=100),
-                    "Demand_Week4": st.column_config.NumberColumn("Week 4 Demand (第4周需求)", min_value=0, step=100)
-                }
-            )
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("💾 Save Demand (保存需求)", type="primary", use_container_width=True):
-                    st.session_state.demand_forecast = edited_demand
-                    st.session_state.success_msg = "✅ Demand forecast saved! (需求预测已保存!)"
-                    st.rerun()
-            
-            with col2:
-                if st.button("🔄 Reset Demand (恢复默认)", use_container_width=True, key="reset_demand"):
-                    st.session_state.demand_forecast = pd.DataFrame({
-                        'Product': ['32Q21K', '32Q21K', '32Q21K', '32Q21K'],
-                        'Channel': ['Amazon', 'Walmart', 'Target', 'Amazon'],
-                        'State': ['CA', 'TX', 'GA', 'PA'],
-                        'Demand_Week3': [2200, 1800, 1600, 1900],
-                        'Demand_Week4': [2300, 1900, 1700, 2000]
-                    })
-                    st.session_state.success_msg = "✅ Demand forecast reset! (需求预测已恢复默认!)"
-                    st.rerun()
-        
-        # Show total demand
-        st.markdown("---")
-        col1, col2 = st.columns(2)
-        with col1:
-            total_w3 = st.session_state.demand_forecast['Demand_Week3'].sum()
-            st.metric("Total Week 3 Demand (第3周总需求)", f"{total_w3:,}")
-        with col2:
-            total_w4 = st.session_state.demand_forecast['Demand_Week4'].sum()
-            st.metric("Total Week 4 Demand (第4周总需求)", f"{total_w4:,}")
-    
     # ======== NEW: Inventory Tab ========
-    with tab6:
+    with tab5:
         st.subheader("Warehouse Inventory & Schedule (仓库库存与调度)")
         
         st.info("💡 按仓库+SKU维护库存和入/出库计划")
@@ -1097,6 +1030,73 @@ if page == "📊 Configuration":
                         st.rerun()
             else:
                 st.warning("Please add warehouses and SKUs first")
+
+    # ======== Original tab3 -> now tab6 ========
+    with tab6:
+        st.subheader("Demand Forecast (需求预测)")
+        
+        # Display current demand
+        st.markdown("**Current Demand Forecast (当前需求预测)**")
+        
+        # Add summary row to demand display
+        demand_display = st.session_state.demand_forecast.copy()
+        summary_row = pd.DataFrame({
+            'Product': ['** TOTAL **'],
+            'Channel': ['All Channels'],
+            'State': ['All States'],
+            'Demand_Week3': [demand_display['Demand_Week3'].sum()],
+            'Demand_Week4': [demand_display['Demand_Week4'].sum()]
+        })
+        demand_with_summary = pd.concat([demand_display, summary_row], ignore_index=True)
+        
+        st.dataframe(demand_with_summary, use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+        
+        with st.expander("✏️ Edit Demand Forecast (编辑需求预测)", expanded=False):
+            st.info("💡 Enter demand for Week 3 and Week 4 only (仅输入第3周和第4周的需求)")
+            
+            edited_demand = st.data_editor(
+                st.session_state.demand_forecast,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_config={
+                    "Product": st.column_config.TextColumn("Product (产品)"),
+                    "Channel": st.column_config.TextColumn("Channel (渠道)"),
+                    "State": st.column_config.TextColumn("State (州)"),
+                    "Demand_Week3": st.column_config.NumberColumn("Week 3 Demand (第3周需求)", min_value=0, step=100),
+                    "Demand_Week4": st.column_config.NumberColumn("Week 4 Demand (第4周需求)", min_value=0, step=100)
+                }
+            )
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Demand (保存需求)", type="primary", use_container_width=True):
+                    st.session_state.demand_forecast = edited_demand
+                    st.session_state.success_msg = "✅ Demand forecast saved! (需求预测已保存!)"
+                    st.rerun()
+            
+            with col2:
+                if st.button("🔄 Reset Demand (恢复默认)", use_container_width=True, key="reset_demand"):
+                    st.session_state.demand_forecast = pd.DataFrame({
+                        'Product': ['32Q21K', '32Q21K', '32Q21K', '32Q21K'],
+                        'Channel': ['Amazon', 'Walmart', 'Target', 'Amazon'],
+                        'State': ['CA', 'TX', 'GA', 'PA'],
+                        'Demand_Week3': [2200, 1800, 1600, 1900],
+                        'Demand_Week4': [2300, 1900, 1700, 2000]
+                    })
+                    st.session_state.success_msg = "✅ Demand forecast reset! (需求预测已恢复默认!)"
+                    st.rerun()
+        
+        # Show total demand
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            total_w3 = st.session_state.demand_forecast['Demand_Week3'].sum()
+            st.metric("Total Week 3 Demand (第3周总需求)", f"{total_w3:,}")
+        with col2:
+            total_w4 = st.session_state.demand_forecast['Demand_Week4'].sum()
+            st.metric("Total Week 4 Demand (第4周总需求)", f"{total_w4:,}")
 
     # ======== Legacy Settings - keep for backward compatibility ========
     with st.expander("⚙️ Legacy Settings (旧设置)", expanded=False):
